@@ -63,10 +63,12 @@ to the executable, so it's ready to go next time you open it.
 ## Building from source
 
 ```powershell
-go build -o vbrouter.exe .
+.\build.ps1
 ```
 
-That's it — no cgo, no MinGW/MSVC required. The only non-standard build step
+The script sets Go's `windowsgui` subsystem, so launching `vbrouter.exe` from
+Explorer does not open a console window. Startup failures appear in a Windows
+message box. No cgo or MinGW/MSVC is required. The only non-standard build step
 is that a Windows manifest (`app.manifest`) requesting Common Controls v6 is
 pre-compiled into [`rsrc_windows_amd64.syso`](rsrc_windows_amd64.syso), which
 `go build` picks up automatically. You only need to regenerate that file if

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/lxn/walk"
+
 	"vbrouter/internal/audio"
 	"vbrouter/internal/config"
 	"vbrouter/internal/ui"
@@ -15,7 +17,7 @@ import (
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "vbrouter:", err)
+		walk.MsgBox(nil, "Voicebox Router", err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
 		os.Exit(1)
 	}
 }
