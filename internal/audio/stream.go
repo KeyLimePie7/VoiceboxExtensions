@@ -42,6 +42,12 @@ func (s *deviceStream) run(deviceID string, ready chan<- error) {
 	defer runtime.UnlockOSThread()
 	defer close(s.closed)
 
+	// Best-effort: if MMCSS registration fails, fall back to running at
+	// normal thread priority rather than refusing to play at all.
+	if revertPriority, err := beginProAudioPriority(); err == nil {
+		defer revertPriority()
+	}
+
 	session, err := openRenderSession(deviceID)
 	ready <- err
 	if err != nil {

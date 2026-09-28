@@ -4,12 +4,16 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"time"
 	"unsafe"
 
 	"github.com/go-ole/go-ole"
 	"github.com/moutend/go-wca/pkg/wca"
 )
+
+// eventWaitTimeoutMs bounds each wait on the render event, so the play loop
+// still gets a chance to notice a closed cancel channel even if the engine
+// were to stop signaling for some reason.
+const eventWaitTimeoutMs = 200
 
 // renderSession owns an open WASAPI shared-mode render stream for one
 // device. All of its methods must be called from the single goroutine that
@@ -21,7 +25,7 @@ type renderSession struct {
 	renderClient *wca.IAudioRenderClient
 	format       *wca.WAVEFORMATEX
 	bufferFrames uint32
-	period       time.Duration
+	event        uintptr
 }
 
 // openRenderSession initializes COM on the current thread, locates the
@@ -58,7 +62,7 @@ func openRenderSession(deviceID string) (session *renderSession, err error) {
 		}
 	}()
 
-	client, format, bufferFrames, period, err := activateClient(device)
+	client, format, bufferFrames, err := activateClient(device)
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +71,21 @@ func openRenderSession(deviceID string) (session *renderSession, err error) {
 			client.Release()
 		}
 	}()
+
+	event := wca.CreateEventExA(0, 0, 0, wca.EVENT_ALL_ACCESS)
+	if event == 0 {
+		err = fmt.Errorf("creating render event")
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			wca.CloseHandle(event)
+		}
+	}()
+
+	if err = client.SetEventHandle(event); err != nil {
+		return nil, fmt.Errorf("setting render event: %w", err)
+	}
 
 	var renderClient *wca.IAudioRenderClient
 	if err = client.GetService(wca.IID_IAudioRenderClient, &renderClient); err != nil {
@@ -89,45 +108,44 @@ func openRenderSession(deviceID string) (session *renderSession, err error) {
 		renderClient: renderClient,
 		format:       format,
 		bufferFrames: bufferFrames,
-		period:       period,
+		event:        event,
 	}, nil
 }
 
-// activateClient activates IAudioClient on device and initializes a
-// shared-mode stream using the device's own mix format.
-func activateClient(device *wca.IMMDevice) (client *wca.IAudioClient, format *wca.WAVEFORMATEX, bufferFrames uint32, period time.Duration, err error) {
+// activateClient activates IAudioClient on device and initializes an
+// event-driven shared-mode stream using the device's own mix format.
+func activateClient(device *wca.IMMDevice) (client *wca.IAudioClient, format *wca.WAVEFORMATEX, bufferFrames uint32, err error) {
 	if err = device.Activate(wca.IID_IAudioClient, wca.CLSCTX_ALL, nil, &client); err != nil {
-		return nil, nil, 0, 0, fmt.Errorf("activating audio client: %w", err)
+		return nil, nil, 0, fmt.Errorf("activating audio client: %w", err)
 	}
 
 	if err = client.GetMixFormat(&format); err != nil {
 		client.Release()
-		return nil, nil, 0, 0, fmt.Errorf("getting mix format: %w", err)
+		return nil, nil, 0, fmt.Errorf("getting mix format: %w", err)
 	}
 
 	var defaultPeriod wca.REFERENCE_TIME
 	if err = client.GetDevicePeriod(&defaultPeriod, nil); err != nil {
 		client.Release()
-		return nil, nil, 0, 0, fmt.Errorf("getting device period: %w", err)
+		return nil, nil, 0, fmt.Errorf("getting device period: %w", err)
 	}
-	period = time.Duration(int64(defaultPeriod) * 100)
 
-	if err = client.Initialize(wca.AUDCLNT_SHAREMODE_SHARED, 0, defaultPeriod, 0, format, nil); err != nil {
+	if err = client.Initialize(wca.AUDCLNT_SHAREMODE_SHARED, wca.AUDCLNT_STREAMFLAGS_EVENTCALLBACK, defaultPeriod, 0, format, nil); err != nil {
 		client.Release()
-		return nil, nil, 0, 0, fmt.Errorf("initializing audio client: %w", err)
+		return nil, nil, 0, fmt.Errorf("initializing audio client: %w", err)
 	}
 
 	if err = client.GetBufferSize(&bufferFrames); err != nil {
 		client.Release()
-		return nil, nil, 0, 0, fmt.Errorf("getting buffer size: %w", err)
+		return nil, nil, 0, fmt.Errorf("getting buffer size: %w", err)
 	}
 
-	return client, format, bufferFrames, period, nil
+	return client, format, bufferFrames, nil
 }
 
 // play converts pcm to this session's device format and feeds it into the
-// render buffer at the endpoint's own pace. It returns early without error
-// if cancel is closed mid-playback.
+// render buffer each time the engine signals it needs more data. It returns
+// early without error if cancel is closed mid-playback.
 func (s *renderSession) play(pcm PCM, cancel <-chan struct{}) error {
 	converted := Resample(pcm, int(s.format.NSamplesPerSec), int(s.format.NChannels))
 	frameBytes := renderFrameBytes(converted, s.format.WBitsPerSample)
@@ -141,6 +159,12 @@ func (s *renderSession) play(pcm PCM, cancel <-chan struct{}) error {
 		default:
 		}
 
+		// WAIT_OBJECT_0 (0) means the engine is ready for more data; anything
+		// else (timeout included) just loops back around to re-check cancel.
+		if result := wca.WaitForSingleObject(s.event, eventWaitTimeoutMs); result != 0 {
+			continue
+		}
+
 		var padding uint32
 		if err := s.client.GetCurrentPadding(&padding); err != nil {
 			return fmt.Errorf("getting padding: %w", err)
@@ -148,7 +172,6 @@ func (s *renderSession) play(pcm PCM, cancel <-chan struct{}) error {
 
 		available := int(s.bufferFrames - padding)
 		if available <= 0 {
-			time.Sleep(s.period / 2)
 			continue
 		}
 		if remaining := totalFrames - offset; available > remaining {
@@ -169,11 +192,12 @@ func (s *renderSession) play(pcm PCM, cancel <-chan struct{}) error {
 		}
 
 		offset += available
-		time.Sleep(s.period / 2)
 	}
 
-	// Give the engine time to drain the last chunk before returning.
-	time.Sleep(s.period)
+	// Wait for one more signal so the engine finishes draining the last
+	// chunk before we return (and the caller potentially tears the stream
+	// down for a one-shot/cold play).
+	wca.WaitForSingleObject(s.event, eventWaitTimeoutMs)
 	return nil
 }
 
@@ -185,6 +209,7 @@ func (s *renderSession) close() {
 	s.client.Release()
 	s.device.Release()
 	s.enumerator.Release()
+	wca.CloseHandle(s.event)
 	ole.CoTaskMemFree(uintptr(unsafe.Pointer(s.format)))
 	ole.CoUninitialize()
 }
